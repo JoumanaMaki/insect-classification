@@ -112,3 +112,6 @@ for epoch in range(EPOCHS):
         f"Val Loss: {avg_val_loss:.4f} | "
         f"Val Acc: {val_acc:.2f}%"
     )
+
+torch.save(model.state_dict(), "checkpoints/resnet18_ip102_baseline.pth")
+print("Model saved to checkpoints/resnet18_ip102_baseline.pth")
