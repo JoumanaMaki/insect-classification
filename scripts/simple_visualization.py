@@ -15,4 +15,5 @@ for ax, (_, row) in zip(axs.flatten(), df.iterrows()):
     ax.axis("off")
 
 plt.tight_layout()
-plt.show()
+plt.savefig("scripts/visualization.png", dpi=150, bbox_inches="tight")
+print("Saved visualization.png")

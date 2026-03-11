@@ -34,5 +34,5 @@ print("\nLargest classes:")
 print(counts.tail())
 
 
-# df.to_csv(DATA_PATH/"metadata.csv",index=False)
-# print("\nSaved metadata.csv")
+df.to_csv(DATA_PATH/"metadata.csv",index=False)
+print("\nSaved metadata.csv")
