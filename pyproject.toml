@@ -1,7 +1,7 @@
 [project]
 name = "insect-classification"
 version = "0.1.0"
-description = "Add your description here"
+description = "Master Thesis"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
