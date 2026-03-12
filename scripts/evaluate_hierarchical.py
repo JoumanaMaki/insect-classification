@@ -1,6 +1,10 @@
+import argparse
+import json
 import os
 import sys
+from pathlib import Path
 
+import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -10,51 +14,20 @@ from torchvision.models import resnet18
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from datasets.ip102_hier_dataset import IP102HierDataset
+from utils.experiment_utils import TeeLogger, load_experiment_config, resolve_checkpoint
+from utils.train_utils import AverageMeter, load_checkpoint
 
-# Paths
-METADATA = "data/ip102/metadata_hierarchical.csv"
-IMAGES = "data/ip102/images"
-CHECKPOINT = "checkpoints/resnet18_ip102_hierarchical.pth"
 
-# Device
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using device:", device)
-
-# Test transforms
-test_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-])
-
-# Dataset
-test_dataset = IP102HierDataset(
-    metadata_csv=METADATA,
-    images_dir=IMAGES,
-    split="test",
-    transform=test_transform,
-)
-
-test_loader = DataLoader(
-    test_dataset,
-    batch_size=32,
-    shuffle=False,
-    num_workers=4,
-    pin_memory=True,
-)
-
-print("Test size:", len(test_dataset))
-
-# Infer taxonomy class counts from metadata
-import pandas as pd
-df = pd.read_csv(METADATA)
-num_label_classes = 102
-num_genus_classes = df["genus_id"].nunique()
-num_family_classes = df["family_id"].nunique()
-num_order_classes = df["order_id"].nunique()
-
-print("Genus classes:", num_genus_classes)
-print("Family classes:", num_family_classes)
-print("Order classes:", num_order_classes)
+DEFAULTS = {
+    "experiment_root": "experiments",
+    "task_name": "hierarchical_baseline",
+    "metadata_csv": "data/ip102/metadata_hierarchical.csv",
+    "images_dir": "data/ip102/images",
+    "num_label_classes": 102,
+    "batch_size": 32,
+    "num_workers": 4,
+    "image_size": 224,
+}
 
 
 class HierResNet(nn.Module):
@@ -64,7 +37,6 @@ class HierResNet(nn.Module):
         in_features = backbone.fc.in_features
         backbone.fc = nn.Identity()
         self.backbone = backbone
-
         self.label_head = nn.Linear(in_features, num_label_classes)
         self.genus_head = nn.Linear(in_features, num_genus_classes)
         self.family_head = nn.Linear(in_features, num_family_classes)
@@ -80,67 +52,105 @@ class HierResNet(nn.Module):
         }
 
 
-# Build model
-model = HierResNet(
-    num_label_classes=num_label_classes,
-    num_genus_classes=num_genus_classes,
-    num_family_classes=num_family_classes,
-    num_order_classes=num_order_classes,
-)
 
-# Load checkpoint
-model.load_state_dict(torch.load(CHECKPOINT, map_location=device))
-model = model.to(device)
-model.eval()
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--exp_dir", type=str, default=None)
+    parser.add_argument("--experiment_root", type=str, default=DEFAULTS["experiment_root"])
+    parser.add_argument("--task_name", type=str, default=DEFAULTS["task_name"])
+    parser.add_argument("--save_name", type=str, default="test_metrics.json")
+    return parser.parse_args()
 
-criterion = nn.CrossEntropyLoss()
 
-# Evaluation
-test_loss = 0.0
-correct = 0
-total = 0
 
-# Optional: track taxonomy accuracies too
-correct_genus = 0
-correct_family = 0
-correct_order = 0
+def taxonomy_sizes(metadata_csv):
+    df = pd.read_csv(metadata_csv)
+    return {
+        "num_genus_classes": int(df["genus_id"].nunique()),
+        "num_family_classes": int(df["family_id"].nunique()),
+        "num_order_classes": int(df["order_id"].nunique()),
+    }
 
-with torch.no_grad():
-    for batch in test_loader:
-        images = batch["image"].to(device, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True)
-        genus_ids = batch["genus_id"].to(device, non_blocking=True)
-        family_ids = batch["family_id"].to(device, non_blocking=True)
-        order_ids = batch["order_id"].to(device, non_blocking=True)
 
-        outputs = model(images)
 
-        # Main benchmark loss on label head
-        loss = criterion(outputs["label"], labels)
-        test_loss += loss.item()
+def main():
+    args = parse_args()
+    checkpoint_path = resolve_checkpoint(args.checkpoint, args.exp_dir, args.experiment_root, args.task_name, prefer="best")
+    exp_dir = args.exp_dir or str(Path(checkpoint_path).resolve().parents[1])
 
-        # Main prediction
-        preds = outputs["label"].argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+    config = DEFAULTS.copy()
+    if (Path(exp_dir) / "config.json").exists():
+        config.update(load_experiment_config(exp_dir))
+    config.update(taxonomy_sizes(config["metadata_csv"]))
 
-        # Optional auxiliary accuracies
-        genus_preds = outputs["genus"].argmax(dim=1)
-        family_preds = outputs["family"].argmax(dim=1)
-        order_preds = outputs["order"].argmax(dim=1)
+    logger = TeeLogger(Path(exp_dir) / "logs" / "evaluate.log", logger_name=f"eval_{config['task_name']}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Evaluating checkpoint: {checkpoint_path}")
+    logger.info(f"Using device: {device}")
 
-        correct_genus += (genus_preds == genus_ids).sum().item()
-        correct_family += (family_preds == family_ids).sum().item()
-        correct_order += (order_preds == order_ids).sum().item()
+    test_transform = transforms.Compose([
+        transforms.Resize((config["image_size"], config["image_size"])),
+        transforms.ToTensor(),
+    ])
+    test_dataset = IP102HierDataset(config["metadata_csv"], config["images_dir"], split="test", transform=test_transform)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=config["batch_size"],
+        shuffle=False,
+        num_workers=config["num_workers"],
+        pin_memory=True,
+    )
 
-avg_test_loss = test_loss / len(test_loader)
-test_acc = 100.0 * correct / total
-genus_acc = 100.0 * correct_genus / total
-family_acc = 100.0 * correct_family / total
-order_acc = 100.0 * correct_order / total
+    model = HierResNet(
+        num_label_classes=config["num_label_classes"],
+        num_genus_classes=config["num_genus_classes"],
+        num_family_classes=config["num_family_classes"],
+        num_order_classes=config["num_order_classes"],
+    )
+    load_checkpoint(checkpoint_path, model, device=device)
+    model = model.to(device)
+    model.eval()
 
-print(f"Test Loss (label head): {avg_test_loss:.4f}")
-print(f"Test Accuracy (label head): {test_acc:.2f}%")
-print(f"Genus Accuracy: {genus_acc:.2f}%")
-print(f"Family Accuracy: {family_acc:.2f}%")
-print(f"Order Accuracy: {order_acc:.2f}%")
+    ce = nn.CrossEntropyLoss()
+    loss_meter = AverageMeter()
+    label_correct = genus_correct = family_correct = order_correct = 0
+    total = 0
+
+    with torch.no_grad():
+        for batch in test_loader:
+            images = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].to(device, non_blocking=True)
+            genus_ids = batch["genus_id"].to(device, non_blocking=True)
+            family_ids = batch["family_id"].to(device, non_blocking=True)
+            order_ids = batch["order_id"].to(device, non_blocking=True)
+
+            outputs = model(images)
+            loss = ce(outputs["label"], labels)
+            loss_meter.update(loss.item(), labels.size(0))
+
+            label_correct += (outputs["label"].argmax(dim=1) == labels).sum().item()
+            genus_correct += (outputs["genus"].argmax(dim=1) == genus_ids).sum().item()
+            family_correct += (outputs["family"].argmax(dim=1) == family_ids).sum().item()
+            order_correct += (outputs["order"].argmax(dim=1) == order_ids).sum().item()
+            total += labels.size(0)
+
+    metrics = {
+        "test_loss_label_head": loss_meter.avg,
+        "test_label_acc": 100.0 * label_correct / max(total, 1),
+        "test_genus_acc": 100.0 * genus_correct / max(total, 1),
+        "test_family_acc": 100.0 * family_correct / max(total, 1),
+        "test_order_acc": 100.0 * order_correct / max(total, 1),
+        "checkpoint": checkpoint_path,
+    }
+    out_path = Path(exp_dir) / "metrics" / args.save_name
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+    logger.info(json.dumps(metrics, indent=2))
+    print(json.dumps(metrics, indent=2))
+
+
+if __name__ == "__main__":
+    main()
