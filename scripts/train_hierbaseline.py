@@ -9,14 +9,26 @@ from torchvision.models import resnet18, ResNet18_Weights
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from datasets.ip102_hier_dataset import IP102HierDataset
+from datasets.ip102_dataset import IP102Dataset
+from utils.train_utils import HistoryTracker, save_checkpoint, print_epoch_metrics
+from utils.plot_utils import plot_history
+from utils.experiment_utils import create_experiment_dir
 
-METADATA = "data/ip102/metadata_hierarchical.csv"
+EXP_DIR = create_experiment_dir("experiments", "HierarchicalBaseline")
+
+
+# Paths
+METADATA = "data/ip102/metadata.csv"
 IMAGES = "data/ip102/images"
+CHECKPOINT_PATH = f"{EXP_DIR}/checkpoint.pth"
+HISTORY_PATH = f"{EXP_DIR}/history.json"
+PLOTS_DIR = f"{EXP_DIR}/plots"
 
+# Device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
+# Transforms
 train_transform = transforms.Compose([
     transforms.Resize((256, 256)),
     transforms.RandomCrop(224),
@@ -29,80 +41,51 @@ val_transform = transforms.Compose([
     transforms.ToTensor(),
 ])
 
-train_dataset = IP102HierDataset(METADATA, IMAGES, split="train", transform=train_transform)
-val_dataset = IP102HierDataset(METADATA, IMAGES, split="val", transform=val_transform)
-
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+# Dataset
+train_dataset = IP102Dataset(METADATA, IMAGES, split="train", transform=train_transform)
+val_dataset = IP102Dataset(METADATA, IMAGES, split="val", transform=val_transform)
 
 print("Train size:", len(train_dataset))
 print("Val size:", len(val_dataset))
 
-# number of classes
-num_label_classes = 102
-num_genus_classes = train_dataset.df["genus_id"].nunique()
-num_family_classes = train_dataset.df["family_id"].nunique()
-num_order_classes = train_dataset.df["order_id"].nunique()
+# DataLoader
+train_loader = DataLoader(
+    train_dataset,
+    batch_size=32,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True,
+)
+val_loader = DataLoader(
+    val_dataset,
+    batch_size=32,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True,
+)
 
-print("Genus classes:", num_genus_classes)
-print("Family classes:", num_family_classes)
-print("Order classes:", num_order_classes)
-
-class HierResNet(nn.Module):
-    def __init__(self, num_label_classes, num_genus_classes, num_family_classes, num_order_classes):
-        super().__init__()
-        backbone = resnet18(weights=ResNet18_Weights.DEFAULT)
-        in_features = backbone.fc.in_features
-        backbone.fc = nn.Identity()
-        self.backbone = backbone
-
-        self.label_head = nn.Linear(in_features, num_label_classes)
-        self.genus_head = nn.Linear(in_features, num_genus_classes)
-        self.family_head = nn.Linear(in_features, num_family_classes)
-        self.order_head = nn.Linear(in_features, num_order_classes)
-
-    def forward(self, x):
-        feats = self.backbone(x)
-        return {
-            "label": self.label_head(feats),
-            "genus": self.genus_head(feats),
-            "family": self.family_head(feats),
-            "order": self.order_head(feats),
-        }
-
-model = HierResNet(
-    num_label_classes=num_label_classes,
-    num_genus_classes=num_genus_classes,
-    num_family_classes=num_family_classes,
-    num_order_classes=num_order_classes,
-).to(device)
+# Model
+model = resnet18(weights=ResNet18_Weights.DEFAULT)
+model.fc = nn.Linear(model.fc.in_features, 102)
+model = model.to(device)
 
 criterion = nn.CrossEntropyLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-EPOCHS = 5
+EPOCHS = 30
+tracker = HistoryTracker()
 
-for epoch in range(EPOCHS):
+for epoch in range(1, EPOCHS + 1):
     model.train()
     total_loss = 0.0
 
-    for batch in train_loader:
-        images = batch["image"].to(device, non_blocking=True)
-        labels = batch["label"].to(device, non_blocking=True)
-        genus_ids = batch["genus_id"].to(device, non_blocking=True)
-        family_ids = batch["family_id"].to(device, non_blocking=True)
-        order_ids = batch["order_id"].to(device, non_blocking=True)
+    for images, labels in train_loader:
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-
         outputs = model(images)
-
-        loss_label = criterion(outputs["label"], labels)
-        loss_genus = criterion(outputs["genus"], genus_ids)
-        loss_family = criterion(outputs["family"], family_ids)
-        loss_order = criterion(outputs["order"], order_ids)
-
-        loss = loss_label + 0.5 * loss_genus + 0.3 * loss_family + 0.2 * loss_order
+        loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
 
@@ -110,44 +93,35 @@ for epoch in range(EPOCHS):
 
     avg_train_loss = total_loss / len(train_loader)
 
-    # Validation
     model.eval()
-    correct_label = 0
+    correct = 0
     total = 0
     val_loss = 0.0
 
     with torch.no_grad():
-        for batch in val_loader:
-            images = batch["image"].to(device, non_blocking=True)
-            labels = batch["label"].to(device, non_blocking=True)
-            genus_ids = batch["genus_id"].to(device, non_blocking=True)
-            family_ids = batch["family_id"].to(device, non_blocking=True)
-            order_ids = batch["order_id"].to(device, non_blocking=True)
+        for images, labels in val_loader:
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
 
             outputs = model(images)
-
-            loss_label = criterion(outputs["label"], labels)
-            loss_genus = criterion(outputs["genus"], genus_ids)
-            loss_family = criterion(outputs["family"], family_ids)
-            loss_order = criterion(outputs["order"], order_ids)
-
-            loss = loss_label + 0.5 * loss_genus + 0.3 * loss_family + 0.2 * loss_order
+            loss = criterion(outputs, labels)
             val_loss += loss.item()
 
-            preds = outputs["label"].argmax(dim=1)
-            correct_label += (preds == labels).sum().item()
+            preds = outputs.argmax(dim=1)
+            correct += (preds == labels).sum().item()
             total += labels.size(0)
 
     avg_val_loss = val_loss / len(val_loader)
-    val_acc = 100.0 * correct_label / total
+    val_acc = 100.0 * correct / total
 
-    print(
-        f"Epoch {epoch+1}/{EPOCHS} | "
-        f"Train Loss: {avg_train_loss:.4f} | "
-        f"Val Loss: {avg_val_loss:.4f} | "
-        f"Val Label Acc: {val_acc:.2f}%"
-    )
+    metrics = {
+        "train_loss": avg_train_loss,
+        "val_loss": avg_val_loss,
+        "val_acc": val_acc,
+    }
+    tracker.update(metrics)
+    print_epoch_metrics(epoch, EPOCHS, metrics)
 
-os.makedirs("checkpoints", exist_ok=True)
-torch.save(model.state_dict(), "checkpoints/resnet18_ip102_hierarchical.pth")
-print("Saved checkpoint: checkpoints/resnet18_ip102_hierarchical.pth")
+save_checkpoint(model, CHECKPOINT_PATH)
+tracker.save_json(HISTORY_PATH)
+plot_history(tracker.get(), PLOTS_DIR, prefix="baseline")
