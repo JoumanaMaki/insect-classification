@@ -1,0 +1,19 @@
+{
+  "experiment_root": "experiments",
+  "task_name": "baseline",
+  "run_name": "resnet18",
+  "metadata_csv": "data/ip102/metadata.csv",
+  "images_dir": "data/ip102/images",
+  "num_classes": 102,
+  "batch_size": 32,
+  "num_workers": 4,
+  "epochs": 30,
+  "lr": 0.0001,
+  "weight_decay": 0.0,
+  "seed": 42,
+  "deterministic": false,
+  "image_size": 224,
+  "resize_size": 256,
+  "pretrained": true,
+  "save_every": 1
+}
